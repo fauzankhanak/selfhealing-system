@@ -1,5 +1,6 @@
 const axios = require('axios');
 const { getDatabase } = require('../database/init');
+const { upsertDocument } = require('./vectorService');
 
 const db = getDatabase();
 
@@ -22,25 +23,30 @@ const confluenceApi = axios.create({
 
 const searchConfluence = async (query) => {
   try {
-    // First check cache
     const cachedResults = await searchCache(query);
     if (cachedResults.length > 0) {
       console.log(`📚 Found ${cachedResults.length} cached Confluence results`);
+      // Fire-and-forget index to vector store
+      cachedResults.forEach(r => upsertDocument({
+        source: 'confluence',
+        source_id: r.page_id,
+        title: r.title,
+        url: r.url,
+        content: r.content,
+        metadata: { page_id: r.page_id }
+      }));
       return cachedResults;
     }
 
     if (!CONFLUENCE_BASE_URL || !CONFLUENCE_USERNAME || !CONFLUENCE_API_TOKEN) {
       console.log('⚠️ Confluence credentials not configured, using mock data');
-      return getMockConfluenceData(query);
+      const mock = getMockConfluenceData(query);
+      mock.forEach(r => upsertDocument({ source: 'confluence', source_id: r.page_id, title: r.title, url: r.url, content: r.content, metadata: { page_id: r.page_id, mock: true } }));
+      return mock;
     }
 
-    // Search Confluence API
     const searchResponse = await confluenceApi.get('/rest/api/content/search', {
-      params: {
-        cql: `text ~ "${query}" AND type = page`,
-        limit: 10,
-        expand: 'body.storage'
-      }
+      params: { cql: `text ~ "${query}" AND type = page`, limit: 10, expand: 'body.storage' }
     });
 
     const results = searchResponse.data.results.map(page => ({
@@ -51,37 +57,41 @@ const searchConfluence = async (query) => {
       last_updated: page.lastUpdated
     }));
 
-    // Cache results
     await cacheResults(results);
+
+    // Index to vector DB (best-effort)
+    results.forEach(r => upsertDocument({
+      source: 'confluence',
+      source_id: r.page_id,
+      title: r.title,
+      url: r.url,
+      content: r.content,
+      metadata: { page_id: r.page_id }
+    }));
 
     console.log(`🔍 Found ${results.length} Confluence results for query: "${query}"`);
     return results;
 
   } catch (error) {
     console.error('Confluence search error:', error.message);
-    
-    // Fallback to mock data
-    return getMockConfluenceData(query);
+    const mock = getMockConfluenceData(query);
+    mock.forEach(r => upsertDocument({ source: 'confluence', source_id: r.page_id, title: r.title, url: r.url, content: r.content, metadata: { page_id: r.page_id, mock: true } }));
+    return mock;
   }
 };
 
 const searchCache = (query) => {
   return new Promise((resolve, reject) => {
     const keywords = query.toLowerCase().split(' ').filter(word => word.length > 2);
-    const searchTerms = keywords.map(word => `%${word}%`).join(' OR ');
-    
+    const like = `%${keywords.join('%')}%`;
     db.all(
       `SELECT * FROM confluence_cache 
        WHERE title LIKE ? OR content LIKE ? 
        ORDER BY last_updated DESC 
        LIMIT 5`,
-      [searchTerms, searchTerms],
+      [like, like],
       (err, rows) => {
-        if (err) {
-          reject(err);
-        } else {
-          resolve(rows || []);
-        }
+        if (err) reject(err); else resolve(rows || []);
       }
     );
   });
@@ -92,7 +102,6 @@ const cacheResults = (results) => {
     const stmt = db.prepare(
       'INSERT OR REPLACE INTO confluence_cache (page_id, title, content, url, last_updated) VALUES (?, ?, ?, ?, ?)'
     );
-    
     results.forEach(result => {
       stmt.run([
         result.page_id,
@@ -102,78 +111,32 @@ const cacheResults = (results) => {
         result.last_updated || new Date().toISOString()
       ]);
     });
-    
-    stmt.finalize((err) => {
-      if (err) reject(err);
-      else resolve();
-    });
+    stmt.finalize(err => err ? reject(err) : resolve());
   });
 };
 
 const getMockConfluenceData = (query) => {
   const mockData = [
-    {
-      page_id: '12345',
-      title: 'Network Connectivity Troubleshooting Guide',
-      content: 'This guide covers common network connectivity issues and their solutions. Step 1: Check physical connections. Step 2: Verify IP configuration. Step 3: Test DNS resolution.',
-      url: 'https://confluence.example.com/pages/viewpage.action?pageId=12345',
-      last_updated: new Date().toISOString()
-    },
-    {
-      page_id: '12346',
-      title: 'Email Configuration Setup',
-      content: 'Complete guide for setting up email clients and troubleshooting common email issues. Includes IMAP, SMTP, and POP3 configurations.',
-      url: 'https://confluence.example.com/pages/viewpage.action?pageId=12346',
-      last_updated: new Date().toISOString()
-    },
-    {
-      page_id: '12347',
-      title: 'VPN Connection Issues',
-      content: 'Troubleshooting guide for VPN connectivity problems. Common issues include certificate errors, authentication failures, and network conflicts.',
-      url: 'https://confluence.example.com/pages/viewpage.action?pageId=12347',
-      last_updated: new Date().toISOString()
-    }
+    { page_id: '12345', title: 'Network Connectivity Troubleshooting Guide', content: 'This guide covers common network connectivity issues and their solutions. Step 1: Check physical connections. Step 2: Verify IP configuration. Step 3: Test DNS resolution.', url: 'https://confluence.example.com/pages/viewpage.action?pageId=12345', last_updated: new Date().toISOString() },
+    { page_id: '12346', title: 'Email Configuration Setup', content: 'Complete guide for setting up email clients and troubleshooting common email issues. Includes IMAP, SMTP, and POP3 configurations.', url: 'https://confluence.example.com/pages/viewpage.action?pageId=12346', last_updated: new Date().toISOString() },
+    { page_id: '12347', title: 'VPN Connection Issues', content: 'Troubleshooting guide for VPN connectivity problems. Common issues include certificate errors, authentication failures, and network conflicts.', url: 'https://confluence.example.com/pages/viewpage.action?pageId=12347', last_updated: new Date().toISOString() }
   ];
-
-  // Filter based on query keywords
   const keywords = query.toLowerCase().split(' ');
-  return mockData.filter(item => 
-    keywords.some(keyword => 
-      item.title.toLowerCase().includes(keyword) || 
-      item.content.toLowerCase().includes(keyword)
-    )
-  );
+  return mockData.filter(item => keywords.some(k => item.title.toLowerCase().includes(k) || item.content.toLowerCase().includes(k)));
 };
 
 const getPageContent = async (pageId) => {
   try {
-    // Check cache first
     const cached = await new Promise((resolve, reject) => {
-      db.get(
-        'SELECT * FROM confluence_cache WHERE page_id = ?',
-        [pageId],
-        (err, row) => {
-          if (err) reject(err);
-          else resolve(row);
-        }
-      );
+      db.get('SELECT * FROM confluence_cache WHERE page_id = ?', [pageId], (err, row) => err ? reject(err) : resolve(row));
     });
-
-    if (cached) {
-      return cached;
-    }
+    if (cached) return cached;
 
     if (!CONFLUENCE_BASE_URL || !CONFLUENCE_USERNAME || !CONFLUENCE_API_TOKEN) {
       throw new Error('Confluence credentials not configured');
     }
 
-    // Fetch from API
-    const response = await confluenceApi.get(`/rest/api/content/${pageId}`, {
-      params: {
-        expand: 'body.storage'
-      }
-    });
-
+    const response = await confluenceApi.get(`/rest/api/content/${pageId}`, { params: { expand: 'body.storage' } });
     const page = response.data;
     const result = {
       page_id: page.id,
@@ -183,8 +146,9 @@ const getPageContent = async (pageId) => {
       last_updated: page.lastUpdated
     };
 
-    // Cache the result
     await cacheResults([result]);
+    // Index to vector DB
+    upsertDocument({ source: 'confluence', source_id: result.page_id, title: result.title, url: result.url, content: result.content, metadata: { page_id: result.page_id } });
 
     return result;
 

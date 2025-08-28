@@ -8,12 +8,13 @@ A comprehensive troubleshooting system that integrates your organization's Confl
 - **AI-Powered Chat Interface**: Natural language troubleshooting with OpenAI GPT-4
 - **Confluence Integration**: Search and reference your organization's documentation
 - **Jira Integration**: Find related tickets and issues
+- **Vector Database (pgvector)**: Semantic search over your docs/tickets for Retrieval-Augmented Generation (RAG)
 - **Session Management**: Create, manage, and export chat sessions
 - **History Tracking**: View past conversations and recommendations
 - **Analytics Dashboard**: Insights into usage patterns and system performance
 
 ### Technical Features
-- **Real-time Chat**: Instant AI responses with source attribution
+- **RAG Pipeline**: Embeds Confluence/Jira content -> stores in pgvector -> retrieves for GPT context
 - **Confidence Scoring**: AI confidence levels for recommendations
 - **Caching System**: Efficient caching of Confluence and Jira data
 - **Export Functionality**: Export chat sessions as JSON
@@ -23,14 +24,14 @@ A comprehensive troubleshooting system that integrates your organization's Confl
 ## 🏗️ Architecture
 
 ```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   React Client  │    │  Node.js Server │    │   External APIs │
-│                 │    │                 │    │                 │
-│ • Chat UI       │◄──►│ • Express API   │◄──►│ • OpenAI API    │
-│ • History       │    │ • SQLite DB     │    │ • Confluence    │
-│ • Analytics     │    │ • JWT Auth      │    │ • Jira          │
-│ • Authentication│    │ • Rate Limiting │    │                 │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
+┌─────────────────┐    ┌─────────────────┐    ┌───────────────────────────┐
+│   React Client  │    │  Node.js Server │    │       External APIs       │
+│                 │    │                 │    │                           │
+│ • Chat UI       │◄──►│ • Express API   │◄──►│ • OpenAI API (GPT + Embd) │
+│ • History       │    │ • SQLite (state)│    │ • Confluence              │
+│ • Analytics     │    │ • pgvector (RAG)│    │ • Jira                    │
+│ • Authentication│    │ • JWT Auth      │    │                           │
+└─────────────────┘    └─────────────────┘    └───────────────────────────┘
 ```
 
 ## 📋 Prerequisites
@@ -63,16 +64,14 @@ A comprehensive troubleshooting system that integrates your organization's Confl
    # Required
    OPENAI_API_KEY=your-openai-api-key
    JWT_SECRET=your-secret-key
-   
-   # Optional - Confluence
-   CONFLUENCE_BASE_URL=https://your-domain.atlassian.net/wiki
-   CONFLUENCE_USERNAME=your-email@domain.com
-   CONFLUENCE_API_TOKEN=your-api-token
-   
-   # Optional - Jira
-   JIRA_BASE_URL=https://your-domain.atlassian.net
-   JIRA_USERNAME=your-email@domain.com
-   JIRA_API_TOKEN=your-api-token
+   EMBEDDING_MODEL=text-embedding-3-small
+
+   # pgvector
+   VECTOR_DB_HOST=localhost
+   VECTOR_DB_PORT=5432
+   VECTOR_DB_USER=postgres
+   VECTOR_DB_PASSWORD=postgres
+   VECTOR_DB_NAME=vectors
    ```
 
 4. **Start the development servers**
@@ -84,62 +83,31 @@ A comprehensive troubleshooting system that integrates your organization's Confl
    - Backend server on http://localhost:5000
    - Frontend client on http://localhost:3000
 
-## 🔧 Configuration
+## 🧠 Vector Database (pgvector)
 
-### OpenAI Setup
-1. Get an API key from [OpenAI Platform](https://platform.openai.com/)
-2. Add it to your `.env` file
+This project includes a pgvector-backed Postgres database for semantic retrieval.
 
-### Confluence Setup (Optional)
-1. Generate an API token in your Atlassian account
-2. Configure the Confluence URL and credentials in `.env`
-3. The system will use mock data if not configured
+### Start pgvector with Docker Compose
+```bash
+docker-compose up -d vectordb
+```
 
-### Jira Setup (Optional)
-1. Generate an API token in your Atlassian account
-2. Configure the Jira URL and credentials in `.env`
-3. The system will use mock data if not configured
+The app service already depends on `vectordb` when using `docker-compose up -d`.
 
-## 🎯 Usage
+### What gets indexed?
+- Confluence search results and page content
+- Jira search results and issue details
 
-### Getting Started
-1. Open http://localhost:3000 in your browser
-2. Register a new account or use demo credentials:
-   - Username: `demo`
-   - Password: `demo123`
-3. Create a new chat session
-4. Start describing your technical issue
+Indexing happens automatically (best-effort) whenever data is fetched or found in cache.
 
-### Example Queries
-- "I can't connect to the VPN"
-- "My email client won't sync"
-- "Network is slow in building A"
-- "Printer driver installation failed"
+### How retrieval works
+- When you ask a question, we embed the query
+- We run similarity search in `documents` table (cosine distance)
+- Top matches are injected into the GPT system prompt alongside live Confluence/Jira context
 
-### Features Overview
-
-#### Chat Interface
-- **Real-time AI responses** with step-by-step solutions
-- **Source attribution** showing relevant documentation and tickets
-- **Confidence scoring** indicating AI certainty
-- **Session management** for organizing conversations
-
-#### History & Analytics
-- **Chat history** with searchable sessions
-- **Solution recommendations** with confidence levels
-- **Usage analytics** and insights
-- **Export functionality** for session data
-
-## 🗄️ Database Schema
-
-The system uses SQLite with the following tables:
-
-- **users**: User accounts and authentication
-- **chat_sessions**: Chat conversation sessions
-- **chat_messages**: Individual messages in conversations
-- **confluence_cache**: Cached Confluence documentation
-- **jira_cache**: Cached Jira tickets
-- **solution_recommendations**: AI-generated solutions
+### Table schema
+- `documents(id, source, source_id, title, url, content, metadata, embedding VECTOR, updated_at)`
+- Index: `ivfflat` over `embedding` (cosine)
 
 ## 🔌 API Endpoints
 
@@ -200,6 +168,18 @@ EXPOSE 3000
 CMD ["npm", "start"]
 ```
 
+### Docker (App + Vector DB)
+```bash
+docker-compose up -d
+```
+- App: http://localhost:3000
+- Vector DB: localhost:5432
+
+### Production Notes
+- Consider moving stateful data from SQLite to Postgres
+- Set stronger secrets and restrict DB access
+- Tune pgvector index with appropriate `lists`/`probes` for your dataset size
+
 ## 🔒 Security Features
 
 - **JWT Authentication** with secure token management
@@ -255,4 +235,4 @@ To update the system:
 
 ---
 
-**Built with ❤️ using React, Node.js, and OpenAI**
+**Built with ❤️ using React, Node.js, OpenAI, and pgvector**
